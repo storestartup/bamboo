@@ -1,5 +1,4 @@
-if Code.ensure_loaded?(Phoenix) do
-  defmodule Bamboo.Phoenix do
+defmodule Bamboo.Phoenix do
     @moduledoc """
     Render templates and layouts with Phoenix.
 
@@ -285,5 +284,4 @@ if Code.ensure_loaded?(Phoenix) do
       assigns
       )
     end
-  end
 end
