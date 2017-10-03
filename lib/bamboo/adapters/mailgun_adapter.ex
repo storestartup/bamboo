@@ -23,14 +23,16 @@ defmodule Bamboo.MailgunAdapter do
   @base_uri "https://api.mailgun.net/v3/"
   @behaviour Bamboo.Adapter
 
-  alias Bamboo.Email
+  alias Bamboo.{Email, Attachment}
   import Bamboo.ApiError
 
-  def deliver(email, config) do
-    body = email |> to_mailgun_body |> Plug.Conn.Query.encode
+  def supports_attachments?, do: true
 
-    case :hackney.post(full_uri(config), headers(config), body, [:with_body]) do
-      {:ok, status, _headers, response} when status > 299 ->
+  def deliver(email, config) do
+    body = to_mailgun_body(email)
+
+    case :hackney.post(full_uri(config), headers(email, config), body, [:with_body]) do
+      {:ok, status, headers, response} when status > 299 ->
         raise_api_error(@service_name, response, body)
       {:ok, status, headers, response} ->
         %{status_code: status, headers: headers, body: response}
@@ -59,65 +61,114 @@ defmodule Bamboo.MailgunAdapter do
     """
   end
 
-  defp headers(config) do
+  defp headers(email, config) do
     [
-      {"Content-Type", "application/x-www-form-urlencoded"},
+      {"Content-Type", content_type(email)},
       {"Authorization", "Basic #{auth_token(config)}"},
     ]
   end
+
+  def content_type(%{attachments: []}), do: "application/x-www-form-urlencoded"
+  def content_type(%{}), do: "multipart/form-data"
 
   defp auth_token(config) do
     Base.encode64("api:" <> config.api_key)
   end
 
-  defp to_mailgun_body(%Email{} = email) do
-    email
-    |> Map.from_struct
-    |> combine_name_and_email
-    |> put_html_body(email)
-    |> put_text_body(email)
+  def to_mailgun_body(%Email{} = email) do
+    %{}
+    |> put_from(email)
+    |> put_to(email)
+    |> put_cc(email)
+    |> put_bcc(email)
+    |> put_reply_to(email)
+    |> put_subject(email)
+    |> put_html(email)
+    |> put_text(email)
     |> put_headers(email)
-    |> filter_non_empty_mailgun_fields
+    |> put_attachments(email)
+    |> put_mailgun_vars(email)
+    |> encode_body()
   end
 
-  defp combine_name_and_email(map) when is_map(map) do
-    Enum.reduce([:from, :to, :cc, :bcc], map, fn key, acc ->
-      Map.put(acc, key, combine_name_and_email(map[key]))
-    end)
-  end
+  def put_from(body, %{from: from}), do: Map.put(body, :from, prepare_recipients(from))
 
-  defp combine_name_and_email(list) when is_list(list) do
-    Enum.map(list, &combine_name_and_email/1)
-  end
+  def put_to(body, %{to: to}), do: Map.put(body, :to, prepare_recipients(to))
 
-  defp combine_name_and_email(tuple) when is_tuple(tuple) do
-    case tuple do
-      {nil, email} -> email
-      {name, email} -> "#{name} <#{email}>"
-    end
-  end
+  def put_cc(body, %{cc: []}), do: body
+  def put_cc(body, %{cc: cc}), do: Map.put(body, :cc, prepare_recipients(cc))
 
-  defp put_html_body(body, %Email{html_body: html_body}), do: Map.put(body, :html, html_body)
+  def put_bcc(body, %{bcc: []}), do: body
+  def put_bcc(body, %{bcc: bcc}), do: Map.put(body, :bcc, prepare_recipients(bcc))
 
-  defp put_text_body(body, %Email{text_body: text_body}), do: Map.put(body, :text, text_body)
+  defp put_reply_to(body, %Email{headers: %{"reply-to" => nil}}), do: body
+  defp put_reply_to(body, %Email{headers: %{"reply-to" => address}}), do: Map.put(body, "h:Reply-To", address)
+  defp put_reply_to(body, %Email{headers: _headers}), do: body
+
+  defp put_subject(body, %{subject: subject}), do: Map.put(body, :subject, subject)
+
+  defp put_text(body, %{text_body: nil}), do: body
+  defp put_text(body, %{text_body: text_body}), do: Map.put(body, :text, text_body)
+
+  defp put_html(body, %{html_body: nil}), do: body
+  defp put_html(body, %{html_body: html_body}), do: Map.put(body, :html, html_body)
 
   defp put_headers(body, %Email{headers: headers}) do
     Enum.reduce(headers, body, fn({key, value}, acc) ->
-      Map.put(acc, :"h:#{key}", value) 
+      Map.put(acc, :"h:#{key}", value)
     end)
   end
 
-  @mailgun_message_fields ~w(from to cc bcc subject text html)a
+  @mailgun_vars [:tag, :campaign, :testmode, :tracking, :"tracking-clicks", :"tracking-opens"]
 
-  def filter_non_empty_mailgun_fields(map) do
-    Enum.filter(map, fn({key, value}) ->
-      # Key is a well known mailgun field or is an header field and its value is not empty
-      (key in @mailgun_message_fields || String.starts_with?(Atom.to_string(key), "h:")) && !(value in [nil, "", []]) 
+  def put_mailgun_vars(body, %Email{private: private}) when is_map(private) do
+    private
+    |> Enum.filter(fn {k, _} -> Enum.member?(@mailgun_vars, k) end)
+    |> Enum.reduce(body, fn({k, v}, acc) ->
+      Map.put(acc, "o:#{k}", v)
     end)
   end
+  def put_mailgun_vars(body, _), do: body
+
+  defp put_attachments(body, %{attachments: []}), do: body
+  defp put_attachments(body, %{attachments: attachments}) do
+    attachment_data = attachments
+    |> Enum.reverse()
+    |> Enum.map(&prepare_file/1)
+    Map.put(body, :attachments, attachment_data)
+  end
+
+  defp prepare_file(attach) do
+    {"attachment", attach.data,
+      {"form-data", [{~s/"name"/, ~s/"attachment"/},
+        {~s/"filename"/, ~s/"#{attach.filename}"/}]},
+      []}
+  end
+
+  def encode_body(%{attachments: attachments} = params) do
+    {:multipart,
+      params
+      |> Map.drop([:attachments])
+      |> Enum.map(fn {k, v} -> {to_string(k), v} end)
+      |> Kernel.++(attachments)
+    }
+  end
+  def encode_body(no_attachments), do: Plug.Conn.Query.encode(no_attachments)
 
   defp full_uri(config) do
     Application.get_env(:bamboo, :mailgun_base_uri, @base_uri)
     <> config.domain <> "/messages"
   end
+
+  defp prepare_recipients(recipients) when is_list(recipients) do
+    recipients
+    |> Enum.map(&prepare_recipient/1)
+    |> Enum.join(",")
+  end
+  defp prepare_recipients(r), do: prepare_recipient(r)
+
+  defp prepare_recipient({nil, address}), do: address
+  defp prepare_recipient({"", address}), do: address
+  defp prepare_recipient({name, address}), do: "#{name} <#{address}>"
+  defp prepare_recipient(r), do: r
 end

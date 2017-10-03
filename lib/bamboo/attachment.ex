@@ -21,7 +21,7 @@ defmodule Bamboo.Attachment do
   def new(path, opts) do
     filename = opts[:filename] || Path.basename(path)
     content_type = opts[:content_type] || determine_content_type(path)
-    data = File.read!(path)
+    data = opts[:data] || File.read!(path)
     %__MODULE__{path: path, data: data, filename: filename, content_type: content_type}
   end
 
