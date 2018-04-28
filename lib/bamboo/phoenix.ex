@@ -251,16 +251,11 @@ defmodule Bamboo.Phoenix do
       template = email.private.view_template
 
       cond do
-        String.ends_with?(template, ".html") ->
-          email |> Map.put(:html_body, render_html(email, template))
         String.ends_with?(template, ".text") ->
           email |> Map.put(:text_body, render_text(email, template))
-        true -> raise ArgumentError, """
-          Template name must end in either ".html" or ".text". Template name was #{inspect template}
-
-          If you would like to render both and html and text template,
-          use an atom without an extension instead.
-          """
+        true ->
+          # default to HTML to allow for other extensions
+          email |> Map.put(:html_body, render_html(email, template))
       end
     end
 
